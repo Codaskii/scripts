@@ -15,14 +15,19 @@ local PetClass = require(ServerScriptService.Classes.Pet)
 local DataService = require(ReplicatedStorage.Shared.Services.DataService).server
 
 --Variables
-local PlayersPets = {} -- [Player] = { [PetId] = Pet object }
-local PlayerDataReady = {} -- true once a player's pets are loaded and equipped
+-- [Player] = { [PetId] = Pet }, a dictionary so a pet is found straight from the id the client sends
+local PlayersPets = {}
+
+-- loading yields, so a request can arrive before a player's pets exist, this flag
+-- is what RequestSync waits on instead of guessing with an arbitrary task.wait
+local PlayerDataReady = {}
+
 local PetActionEvent = Packets.PetAction
 
 
 --Functions
 
--- sends every equipped pet in the server to one player (used for late joiners)
+-- pets equipped before this client joined were broadcast to the clients that already existed
 local function SyncPetsToPlayer(TargetPlayer: Player)
 	for i, Pets in pairs(PlayersPets) do
 		for i, Pet in pairs(Pets) do
@@ -32,7 +37,8 @@ local function SyncPetsToPlayer(TargetPlayer: Player)
 end
 
 
--- every pet gets a unique id, so two of the same pet are still separate items
+-- a GUID rather than the pet's name, because a player can own several of the same
+-- pet and each one needs its own equip state, boost entry and inventory slot
 local function GeneratePetID()
 	return HttpService:GenerateGUID(false)
 end
@@ -51,7 +57,7 @@ local function LoadPets(Player: Player): {}
 end
 
 
--- turns the saved tables back into Pet objects
+-- saved pets are plain tables, these are rebuilt into objects that carry the behaviour
 local function DeserializePets(Pets: {}, Player: Player)
 	for i, Pet in pairs(Pets) do
 		PlayersPets[Player][Pet.Id] = PetClass.Deserialize(Pet)
@@ -59,7 +65,9 @@ local function DeserializePets(Pets: {}, Player: Player)
 end
 
 
--- data stores pets as an array, so we need the index to edit or remove one by its id
+-- data holds pets as an array, so editing or removing one by id means finding its
+-- index first, and the array is re-read on every call rather than cached, because
+-- any removal shifts every index after it and a stale cache would edit the wrong pet
 local function GetPetIndex(Player: Player, PetId: string)
 	local PlayerData = DataService:get(Player, {"Pets"})
 
@@ -73,7 +81,7 @@ local function GetPetIndex(Player: Player, PetId: string)
 end
 
 
--- re-equips whatever the player had on when they left
+-- puts back what the player had on when they left, so boosts and pets carry over
 local function EquipPets(Player: Player)
 	for i, Pet in pairs(PlayersPets[Player]) do
 		if Pet.EquippedBeforeLeave == true then
@@ -83,7 +91,8 @@ local function EquipPets(Player: Player)
 end
 
 
--- checks if the player still has room in their pet storage
+-- storage limit, enforced here rather than in the UI because a client can be modified,
+-- and counted from data rather than the object table so it cannot drift from what is saved
 local function CanClaimPet(Player: Player)
 	local PlayerStats = Player:FindFirstChild("PlayerStats")
 	if not PlayerStats then return false end
@@ -91,7 +100,6 @@ local function CanClaimPet(Player: Player)
 	local PetStorage = PlayerStats:FindFirstChild("PetStorage") :: IntValue?
 	if not PetStorage then return false end
 
-	-- counted from data, not from the object table, so it matches what's actually saved
 	local PetCount = DataService:get(Player, {"Pets"})
 
 	if #PetCount < PetStorage.Value then return true end
@@ -100,7 +108,8 @@ local function CanClaimPet(Player: Player)
 end
 
 
--- checks if the player can equip one more pet
+-- equip limit, counted from the live objects because that is what the boosts are
+-- built from, and checked on the server for the same reason as the storage limit
 local function CanEquip(Player: Player)
 	local PlayerStats = Player:FindFirstChild("PlayerStats")
 	if not PlayerStats then return false end
@@ -126,18 +135,19 @@ end
 local PetServiceServer = {}
 
 
+--Methods
 function PetServiceServer.Init()
 
-	-- load the player's pets, turn them into objects and re-equip the ones they had on
 	Players.PlayerAdded:Connect(function(Player)
+		-- created before the yields below, so anything in between finds an empty table, not nil
 		PlayersPets[Player] = {}
 		DataService:waitForData(Player)
 
-		-- the stats have to exist before equipping, because the boosts are written onto them
+		-- the stats must exist before equipping, since equipping writes boosts onto them
 		local PlayerStats = Player:WaitForChild("PlayerStats")
 		PlayerStats:WaitForChild("BaseIncome")
 
-		-- the player may have left while their data was loading
+		-- three yields have passed by now, so the player may already be gone
 		if not PlayersPets[Player] then return end
 
 		DeserializePets(LoadPets(Player), Player)
@@ -147,8 +157,9 @@ function PetServiceServer.Init()
 	end)
 
 
-	-- cleanup, unequip so other clients remove the pet models and the boosts are dropped
 	Players.PlayerRemoving:Connect(function(Player)
+		-- unequipped on the way out so every other client destroys the pet models and
+		-- the boost entries are released, only then are the tables dropped
 		local Pets = PlayersPets[Player]
 		if Pets then
 			for i, Pet in pairs(Pets) do
@@ -163,14 +174,15 @@ function PetServiceServer.Init()
 	end)
 
 
-	-- every pet request from the client comes through here
+	-- one entry point for every pet request, so ownership is checked in a single place,
 	-- Payload is a pet id for the single-pet actions and a list of ids for DeletePets
 	PetActionEvent.OnServerInvoke = function(Player: Player, ActionType: string, Payload: any)
 		local PlayerPets = PlayersPets[Player]
 		if not PlayerPets then return false end
 
 
-		-- client asks for all pets in the server, wait until this player's data is loaded first
+		-- a joining client asks for the pets it missed, and waits here rather than
+		-- getting an empty list, because its own data may still be loading above
 		if ActionType == "RequestSync" then
 			while not PlayerDataReady[Player] do
 				task.wait()
@@ -181,6 +193,7 @@ function PetServiceServer.Init()
 		end
 
 
+		-- these two act on many pets at once, so they run before the single-pet lookup
 		if ActionType == "EquipBest" then
 			local Success, EquippedIds = PetServiceServer:EquipBest(Player)
 			if not Success then return false end
@@ -197,23 +210,24 @@ function PetServiceServer.Init()
 		end
 
 
-		-- everything below needs a pet the player actually owns
+		-- the id is only looked up inside this player's own table, so a client cannot
+		-- reach another player's pet by sending someone else's id
 		local PetId = Payload
 		local Pet = PetId and PlayerPets[PetId]
 		if not Pet then return false end
 
 
-		-- Equip / Unequip toggle
 		if ActionType == "Equip" then
 			-- the capacity check only applies when equipping, taking a pet off is always allowed
 			if not Pet.Equipped and not CanEquip(Player) then
 				return false, "CantEquip"
 			end
 
+			-- Equip is a toggle and reports which way it went, so the saved flag is set
+			-- from its result rather than assumed
 			local Action = Pet:Equip()
 			if not Action then return false end
 
-			-- save the equip state so it comes back next time they join
 			local PetIndex = GetPetIndex(Player, PetId)
 			if PetIndex then
 				DataService:set(Player, {"Pets", PetIndex, "EquippedBeforeLeave"}, Action == "Equip")
@@ -222,8 +236,8 @@ function PetServiceServer.Init()
 			return true, Action
 
 
-		-- Delete
 		elseif ActionType == "Delete" then
+			-- the pet decides whether it may be deleted, an equipped one refuses
 			if not Pet:Delete() then
 				return false, "Delete"
 			end
@@ -241,7 +255,7 @@ function PetServiceServer.Init()
 end
 
 
--- PetData is the pet's entry from the config
+-- called by eggs, rewards and anything else that hands out a pet, PetData is the config entry
 function PetServiceServer:GivePet(Player: Player, PetData: {})
 	if not Player then return false end
 
@@ -265,7 +279,7 @@ function PetServiceServer:EquipBest(Player: Player)
 	local EquipCapacity = PlayerStats and PlayerStats:FindFirstChild("PetEquipCapacity")
 	if not EquipCapacity then return false end
 
-	-- clearing first means Equip() below never hits the capacity limit
+	-- clearing first frees every slot, so the loop below can never be refused by the capacity limit
 	for _, Pet in pairs(PlayerPets) do
 		if Pet.Equipped then
 			Pet:Unequip()
@@ -277,7 +291,8 @@ function PetServiceServer:EquipBest(Player: Player)
 		table.insert(Sorted, Pet)
 	end
 
-	-- highest boost first, and the id breaks ties so the result is the same every run
+	-- highest boost first, and the id breaks ties so two pets with the same boost always
+	-- come out in the same order, since the pairs loop above guarantees none
 	table.sort(Sorted, function(A, B)
 		local ABoost = A.ShieldBoost or 0
 		local BBoost = B.ShieldBoost or 0
@@ -299,7 +314,7 @@ function PetServiceServer:EquipBest(Player: Player)
 		end
 	end
 
-	-- one pass over the saved array instead of a lookup per pet, and only changed flags are written
+	-- one pass instead of a GetPetIndex search per pet, and only changed flags are written
 	local PlayerData = DataService:get(Player, {"Pets"})
 
 	for Index, PetData in ipairs(PlayerData) do
@@ -326,7 +341,7 @@ function PetServiceServer:DeletePet(Player: Player, PetId: string)
 end
 
 
--- deletes several pets at once, equipped ones are skipped
+-- reports back which pets actually went, so the client removes exactly those slots
 function PetServiceServer:DeletePets(Player: Player, PetIds: {string})
 	local PlayerPets = PlayersPets[Player]
 	if not PlayerPets or typeof(PetIds) ~= "table" then return false end
@@ -336,8 +351,8 @@ function PetServiceServer:DeletePets(Player: Player, PetIds: {string})
 	for _, PetId in ipairs(PetIds) do
 		local Pet = PlayerPets[PetId]
 
-		-- checked here as well, in case the client's own check was bypassed
-		-- DeletePet looks the index up again each time, because every removal shifts the array
+		-- equipped pets are skipped here too, not only in the UI, so a modified client
+		-- cannot delete a pet out from under its own boost
 		if Pet and not Pet.Equipped and Pet:Delete() then
 			if PetServiceServer:DeletePet(Player, PetId) then
 				table.insert(Deleted, PetId)
