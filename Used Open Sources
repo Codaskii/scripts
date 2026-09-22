@@ -2,5 +2,6 @@
 -- Open source packages used:
 --   Packet by Suphi Kaner (networking)
 --   DataService by Leif (player data)
---   Trove by Sleitnick (cleanup)
+--   Trove by Sleitnick, from RbxUtil (cleanup)
 --   Timer by Sleitnick, from RbxUtil (countdown)
+--   Signal by Sleitnick, from RbxUtil (events)
