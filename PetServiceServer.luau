@@ -1,4 +1,7 @@
 -- Discord: codaa1 | Roblox: Codaskii
+-- Open source packages used:
+--   Packet by Suphi Kaner (networking)
+--   DataService by Leif (player data)
 
 --Services
 local Players = game:GetService("Players")
